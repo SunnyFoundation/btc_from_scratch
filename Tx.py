@@ -73,26 +73,22 @@ class Tx:
             tx_outs,
             self.locktime,
         )
-        
-        
+
     def is_coinbase(self):
         if len(self.tx_ins) != 1:
             return False
         first_input = self.tx_ins[0]
-        if first_input.prev_tx != b'\x00' * 32:
+        if first_input.prev_tx != b"\x00" * 32:
             return False
-        if first_input.prev_index != 0xffffffff:
+        if first_input.prev_index != 0xFFFFFFFF:
             return False
         return True
-    
-    
-    
+
     def coinbase_height(self):
         if not self.is_coinbase():
             return None
-        element = self.tx_ins[0].script_sig.cmds[0] 
+        element = self.tx_ins[0].script_sig.cmds[0]
         return little_endian_to_int(element)
-    
 
     def id(self):  # <3>
         # Good for human
@@ -259,6 +255,40 @@ class TxOut:
         return result
 
 
+def encode_coinbase_height(height):
+    """Encode block height using the minimal little-endian format (BIP34)."""
+    if height < 0:
+        raise ValueError("height must be non-negative")
+    if height == 0:
+        return b"\x00"
+    encoded = bytearray()
+    while height:
+        encoded.append(height & 0xFF)
+        height >>= 8
+    if encoded[-1] & 0x80:
+        encoded.append(0x00)
+    return bytes(encoded)
+
+
+def create_coinbase_tx(block_height, address, subsidy_sats, message=b"", testnet=True):
+    """Build a coinbase transaction paying the subsidy to the given address."""
+    if isinstance(message, str):
+        message = message.encode("utf-8")
+    height_field = encode_coinbase_height(block_height)
+    script_cmds = [height_field]
+    if message:
+        script_cmds.append(message)
+    coinbase_input = TxIn(
+        prev_tx=b"\x00" * 32,
+        prev_index=0xFFFFFFFF,
+        script_sig=Script(script_cmds),
+        sequence=0xFFFFFFFF,
+    )
+    h160 = decode_base58(address)
+    reward_output = TxOut(subsidy_sats, p2pkh_script(h160))
+    return Tx(1, [coinbase_input], [reward_output], 0, testnet=testnet)
+
+
 # Tx Fetcher
 
 # txid = "e8336763b819f81ddd6e6849f01f17fec034f4220835fe3892802b105e2543a6"
@@ -316,30 +346,30 @@ class TxOut:
 # print(tx_obj.serialize().hex())
 
 
-prev_tx = bytes.fromhex(
-    "e8336763b819f81ddd6e6849f01f17fec034f4220835fe3892802b105e2543a6"
-)
-prev_index = 0
-target_address = "mnrVtF8DWjMu839VW3rBfgYaAfKk8983Xf"
-target_amount = 0.0005
-change_address = "moMgoV8ouE3i6cQ96PNRcQ63jPonhztGME"
-change_amount = 0.0006
-secret = 205654419802215262823383638835045262042916840092792866665560957952008811891
-priv = PrivateKey(secret=secret)
-tx_ins = []
-tx_ins.append(TxIn(prev_tx, prev_index))
-tx_outs = []
-h160 = decode_base58(target_address)
-script_pubkey = p2pkh_script(h160)
-target_satoshis = int(target_amount * 100000000)
-tx_outs.append(TxOut(target_satoshis, script_pubkey))
-h160 = decode_base58(change_address)
-script_pubkey = p2pkh_script(h160)
-change_satoshis = int(change_amount * 100000000)
-tx_outs.append(TxOut(change_satoshis, script_pubkey))
-tx_obj = Tx(1, tx_ins, tx_outs, 0, testnet=True)
-print(tx_obj)
-print(tx_obj.sign_input(0, priv))
-print(tx_obj.serialize().hex())
+# prev_tx = bytes.fromhex(
+#     "e8336763b819f81ddd6e6849f01f17fec034f4220835fe3892802b105e2543a6"
+# )
+# prev_index = 0
+# target_address = "mnrVtF8DWjMu839VW3rBfgYaAfKk8983Xf"
+# target_amount = 0.0005
+# change_address = "moMgoV8ouE3i6cQ96PNRcQ63jPonhztGME"
+# change_amount = 0.0006
+# secret = 205654419802215262823383638835045262042916840092792866665560957952008811891
+# priv = PrivateKey(secret=secret)
+# tx_ins = []
+# tx_ins.append(TxIn(prev_tx, prev_index))
+# tx_outs = []
+# h160 = decode_base58(target_address)
+# script_pubkey = p2pkh_script(h160)
+# target_satoshis = int(target_amount * 100000000)
+# tx_outs.append(TxOut(target_satoshis, script_pubkey))
+# h160 = decode_base58(change_address)
+# script_pubkey = p2pkh_script(h160)
+# change_satoshis = int(change_amount * 100000000)
+# tx_outs.append(TxOut(change_satoshis, script_pubkey))
+# tx_obj = Tx(1, tx_ins, tx_outs, 0, testnet=True)
+# print(tx_obj)
+# print(tx_obj.sign_input(0, priv))
+# print(tx_obj.serialize().hex())
 
 # 0100000001a643255e102b809238fe350822f434c0fe171ff049686edd1df819b8636733e8000000006b483045022100b251e5d80ae45f13338b4556f3a84618fdeda807a9bdb805ddfb255be18ed5c402201109efad4020cde0790ba5f1fe5b1bb1a0c06da128ae793e222cde9cf6b9f549012103bd39242c1a11b75811ddc46d75a6a03932d6c926db4d12bcd79ce3141f7eb91affffffff0250c30000000000001976a914507b27411ccf7f16f10297de6cef3f291623eddf88ac5fea0000000000001976a91456005480375868d337081b9c08525d78d507ba5988ac00000000

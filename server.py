@@ -1,8 +1,14 @@
+import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from random import randint
-import json
+from typing import Dict, List
+from urllib.parse import parse_qs, urlparse
 
-from Ecc import PrivateKey, N
+from Block import Block, build_candidate_block, mine_block
+from Ecc import N, PrivateKey
+
+BLOCKCHAIN: List[Block] = []
+BALANCES: Dict[str, int] = {}
 
 
 HOST = "127.0.0.1"
@@ -10,28 +16,118 @@ PORT = 8765
 
 
 class AddressHandler(BaseHTTPRequestHandler):
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        if parsed.path == "/balance":
+            self._handle_balance(parsed)
+            return
+        self._send_json({"error": "Not found"}, status=404)
+
     def do_POST(self):
-        if self.path != "/create-address":
-            self.send_error(404, "Not found")
+        if self.path == "/create-address":
+            self._handle_create_address()
+            return
+        if self.path == "/mine":
+            self._handle_mine()
             return
 
-        secret = randint(1, N - 1)
-        priv = PrivateKey(secret)
-        address = priv.point.address(compressed=True, testnet=True)
-
-        payload = json.dumps({"address": address, "secret_hex": priv.hex()}).encode(
-            "utf-8"
-        )
-
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(payload)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.wfile.write(payload)
+        self._send_json({"error": "Not found"}, status=404)
 
     def log_message(self, format, *args):
         return
+
+    def _handle_create_address(self):
+        secret = randint(1, N - 1)
+        priv = PrivateKey(secret)
+        address = priv.point.address(compressed=True, testnet=True)
+        self._send_json({"address": address, "secret_hex": priv.hex()})
+
+    def _handle_balance(self, parsed):
+        query = parse_qs(parsed.query)
+        address = query.get("address", [""])[0].strip()
+        if not address:
+            self._send_json(
+                {"error": "address query parameter is required"}, status=400
+            )
+            return
+        balance_sats = BALANCES.get(address, 0)
+        balance_btc = balance_sats / 100_000_000
+        self._send_json(
+            {
+                "address": address,
+                "balance_sats": balance_sats,
+                "balance_btc": balance_btc,
+            }
+        )
+
+    def _handle_mine(self):
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            self._send_json({"error": "Invalid Content-Length"}, status=411)
+            return
+
+        raw_body = self.rfile.read(content_length) if content_length > 0 else b"{}"
+        try:
+            payload = json.loads(raw_body.decode("utf-8") or "{}")
+        except json.JSONDecodeError:
+            self._send_json({"error": "Invalid JSON body"}, status=400)
+            return
+
+        address = payload.get("address")
+        if not address:
+            self._send_json({"error": "address is required"}, status=400)
+            return
+
+        message = payload.get("message", "")
+        start_nonce = int(payload.get("start_nonce", 0))
+        max_nonce = int(payload.get("max_nonce", 0xFFFFFFFF))
+
+        height = len(BLOCKCHAIN)
+        prev_block = BLOCKCHAIN[-1].hash()[::-1] if BLOCKCHAIN else b"\x00" * 32
+
+        block, coinbase_tx = build_candidate_block(
+            height, prev_block, address, message=message
+        )
+
+        mined_block = mine_block(block, start_nonce=start_nonce, max_nonce=max_nonce)
+        if mined_block is None:
+            self._send_json({"error": "No valid nonce found in range"}, status=503)
+            return
+
+        BLOCKCHAIN.append(mined_block)
+        block_hash = mined_block.hash().hex()
+
+        result = {
+            "height": height,
+            "hash": block_hash,
+            "prev_block": mined_block.prev_block.hex(),
+            "merkle_root": mined_block.merkle_root_bytes[::-1].hex(),
+            "nonce": int.from_bytes(mined_block.nonce, "little"),
+            "timestamp": mined_block.timestamp,
+            "bits": mined_block.bits.hex(),
+            "coinbase_txid": coinbase_tx.id(),
+            "block_hex": mined_block.serialize().hex(),
+        }
+        payout = sum(tx_out.amount for tx_out in coinbase_tx.tx_outs)
+        BALANCES[address] = BALANCES.get(address, 0) + payout
+        self._send_json(result, status=201)
+
+    def _send_json(self, data, status=200):
+        body = json.dumps(data).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
 
 
 if __name__ == "__main__":
