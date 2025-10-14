@@ -1,4 +1,5 @@
 from io import BytesIO
+from turtle import right
 from Script import Script
 from Script import p2pkh_script
 import json
@@ -373,3 +374,5 @@ def create_coinbase_tx(block_height, address, subsidy_sats, message=b"", testnet
 # print(tx_obj.serialize().hex())
 
 # 0100000001a643255e102b809238fe350822f434c0fe171ff049686edd1df819b8636733e8000000006b483045022100b251e5d80ae45f13338b4556f3a84618fdeda807a9bdb805ddfb255be18ed5c402201109efad4020cde0790ba5f1fe5b1bb1a0c06da128ae793e222cde9cf6b9f549012103bd39242c1a11b75811ddc46d75a6a03932d6c926db4d12bcd79ce3141f7eb91affffffff0250c30000000000001976a914507b27411ccf7f16f10297de6cef3f291623eddf88ac5fea0000000000001976a91456005480375868d337081b9c08525d78d507ba5988ac00000000
+
+

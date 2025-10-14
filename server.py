@@ -1,5 +1,7 @@
 import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from io import BytesIO
+from pathlib import Path
 from random import randint
 from typing import Dict, List
 from urllib.parse import parse_qs, urlparse
@@ -9,6 +11,60 @@ from Ecc import N, PrivateKey
 
 BLOCKCHAIN: List[Block] = []
 BALANCES: Dict[str, int] = {}
+
+CHAIN_FILE = Path("genesis_block.bin")
+BALANCES_FILE = Path("balances.json")
+
+
+def _load_blockchain_from_disk():
+    if not CHAIN_FILE.exists():
+        return
+    try:
+        data = CHAIN_FILE.read_bytes()
+    except OSError as err:
+        print(f"Warning: unable to read {CHAIN_FILE}: {err}")
+        return
+    usable_length = len(data) - (len(data) % 80)
+    if usable_length != len(data):
+        print(
+            f"Warning: ignoring {len(data) - usable_length} trailing bytes in {CHAIN_FILE}"
+        )
+    for offset in range(0, usable_length, 80):
+        chunk = data[offset : offset + 80]
+        block = Block.parse(BytesIO(chunk))
+        BLOCKCHAIN.append(block)
+    print(f"Loaded {len(BLOCKCHAIN)} block(s) from {CHAIN_FILE}")
+
+
+def _load_balances_from_disk():
+    if not BALANCES_FILE.exists():
+        return
+    try:
+        payload = json.loads(BALANCES_FILE.read_text())
+    except (OSError, json.JSONDecodeError) as err:
+        print(f"Warning: unable to read {BALANCES_FILE}: {err}")
+        return
+    if not isinstance(payload, dict):
+        print(f"Warning: invalid balances data in {BALANCES_FILE}")
+        return
+    for addr, amount in payload.items():
+        try:
+            BALANCES[addr] = int(amount)
+        except (TypeError, ValueError):
+            print(f"Warning: skipping invalid balance entry for {addr!r}")
+    if BALANCES:
+        print(f"Loaded {len(BALANCES)} balance(s) from {BALANCES_FILE}")
+
+
+def _persist_balances():
+    try:
+        BALANCES_FILE.write_text(json.dumps(BALANCES, separators=(",", ":")))
+    except OSError as err:
+        print(f"Warning: unable to write {BALANCES_FILE}: {err}")
+
+
+_load_blockchain_from_disk()
+_load_balances_from_disk()
 
 
 HOST = "127.0.0.1"
@@ -103,6 +159,8 @@ class AddressHandler(BaseHTTPRequestHandler):
             return
 
         BLOCKCHAIN.append(mined_block)
+        with open("genesis_block.bin", "ab") as f:
+            f.write(mined_block.serialize())
         block_hash = mined_block.hash().hex()
 
         result = {
@@ -118,6 +176,7 @@ class AddressHandler(BaseHTTPRequestHandler):
         }
         payout = sum(tx_out.amount for tx_out in coinbase_tx.tx_outs)
         BALANCES[address] = BALANCES.get(address, 0) + payout
+        _persist_balances()
         self._send_json(result, status=201)
 
     def _send_json(self, data, status=200):
@@ -135,3 +194,6 @@ if __name__ == "__main__":
 
 
 # git remote add origin https://github.com/SunnyFoundation/btc_from_scratch.git
+
+
+# mkaBghpnXRyKQWD47d1RCz2rx3b2gbSQZT
