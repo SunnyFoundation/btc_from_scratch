@@ -1,20 +1,23 @@
 import json
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from io import BytesIO
 from pathlib import Path
 from random import randint
-from typing import Dict, List
+from typing import Dict, List, Tuple
 from urllib.parse import parse_qs, urlparse
 
 from Block import Block, build_candidate_block, mine_block
 from Ecc import N, PrivateKey
-from helper import encode_base58_checksum
+from helper import BASE58_ALPHABET, encode_base58_checksum, hash256
 
 BLOCKCHAIN: List[Block] = []
 BALANCES: Dict[str, int] = {}
+UTXO_SET: Dict[str, Dict[str, int]] = {}
 
 CHAIN_FILE = Path("genesis_block.bin")
 BALANCES_FILE = Path("balances.json")
+UTXO_FILE = Path("utxos.json")
 
 
 def _load_blockchain_from_disk():
@@ -64,8 +67,135 @@ def _persist_balances():
         print(f"Warning: unable to write {BALANCES_FILE}: {err}")
 
 
+def _load_utxos_from_disk():
+    if not UTXO_FILE.exists():
+        return
+    try:
+        payload = json.loads(UTXO_FILE.read_text())
+    except (OSError, json.JSONDecodeError) as err:
+        print(f"Warning: unable to read {UTXO_FILE}: {err}")
+        return
+    if not isinstance(payload, dict):
+        print(f"Warning: invalid utxo data in {UTXO_FILE}")
+        return
+    UTXO_SET.clear()
+    for utxo_id, entry in payload.items():
+        address = entry.get("address")
+        amount = entry.get("amount_sats")
+        if not isinstance(address, str):
+            print(f"Warning: skipping UTXO {utxo_id!r} due to invalid address")
+            continue
+        try:
+            amount_int = int(amount)
+        except (TypeError, ValueError):
+            print(f"Warning: skipping UTXO {utxo_id!r} due to invalid amount")
+            continue
+        if amount_int <= 0:
+            continue
+        UTXO_SET[utxo_id] = {"address": address, "amount_sats": amount_int}
+    if UTXO_SET:
+        print(f"Loaded {len(UTXO_SET)} UTXO(s) from {UTXO_FILE}")
+
+
+def _persist_utxos():
+    try:
+        data = {
+            utxo_id: {"address": utxo["address"], "amount_sats": utxo["amount_sats"]}
+            for utxo_id, utxo in UTXO_SET.items()
+        }
+        UTXO_FILE.write_text(json.dumps(data, separators=(",", ":")))
+    except OSError as err:
+        print(f"Warning: unable to write {UTXO_FILE}: {err}")
+
+
+def _recalculate_balances():
+    BALANCES.clear()
+    for utxo in UTXO_SET.values():
+        addr = utxo["address"]
+        BALANCES[addr] = BALANCES.get(addr, 0) + utxo["amount_sats"]
+
+
+def _bootstrap_utxos_from_balances():
+    if UTXO_SET or not BALANCES:
+        return
+    print("Bootstrapping UTXO set from legacy balances.json data")
+    for index, (addr, amount) in enumerate(BALANCES.items()):
+        if amount <= 0:
+            continue
+        utxo_id = f"legacy-{index}"
+        UTXO_SET[utxo_id] = {"address": addr, "amount_sats": amount}
+    _persist_utxos()
+
+
+def _compute_balance(address: str) -> int:
+    return sum(
+        utxo["amount_sats"]
+        for utxo in UTXO_SET.values()
+        if utxo["address"] == address
+    )
+
+
+def _select_utxos(address: str, target_amount: int) -> Tuple[List[Tuple[str, Dict[str, int]]], int]:
+    gathered: List[Tuple[str, Dict[str, int]]] = []
+    total = 0
+    for utxo_id, utxo in UTXO_SET.items():
+        if utxo["address"] != address:
+            continue
+        gathered.append((utxo_id, utxo))
+        total += utxo["amount_sats"]
+        if total >= target_amount:
+            break
+    return gathered, total
+
+
+def _decode_base58_with_checksum(s: str) -> bytes:
+    num = 0
+    for c in s:
+        if c not in BASE58_ALPHABET:
+            raise ValueError(f"invalid base58 character: {c}")
+        num = num * 58 + BASE58_ALPHABET.index(c)
+    combined = num.to_bytes((num.bit_length() + 7) // 8, "big")
+    pad = 0
+    for char in s:
+        if char == "1":
+            pad += 1
+        else:
+            break
+    combined = b"\x00" * pad + combined
+    if len(combined) < 5:
+        raise ValueError("invalid base58 data")
+    payload, checksum = combined[:-4], combined[-4:]
+    if hash256(payload)[:4] != checksum:
+        raise ValueError("invalid checksum")
+    return payload
+
+
+def _wif_to_private_key(wif: str) -> Tuple[PrivateKey, bool, bool]:
+    payload = _decode_base58_with_checksum(wif)
+    prefix = payload[0]
+    if prefix not in (0x80, 0xEF):
+        raise ValueError("unsupported WIF prefix")
+    compressed = False
+    if len(payload) == 34 and payload[-1] == 0x01:
+        compressed = True
+        secret_bytes = payload[1:-1]
+    elif len(payload) == 33:
+        secret_bytes = payload[1:]
+    else:
+        raise ValueError("unexpected WIF payload length")
+    secret = int.from_bytes(secret_bytes, "big")
+    if not (1 <= secret < N):
+        raise ValueError("invalid secret in WIF")
+    priv = PrivateKey(secret)
+    testnet = prefix == 0xEF
+    return priv, compressed, testnet
+
+
 _load_blockchain_from_disk()
 _load_balances_from_disk()
+_load_utxos_from_disk()
+_bootstrap_utxos_from_balances()
+_recalculate_balances()
 
 
 HOST = "127.0.0.1"
@@ -94,6 +224,9 @@ class AddressHandler(BaseHTTPRequestHandler):
         if self.path == "/mine":
             self._handle_mine()
             return
+        if self.path == "/send":
+            self._handle_send()
+            return
 
         self._send_json({"error": "Not found"}, status=404)
 
@@ -116,6 +249,8 @@ class AddressHandler(BaseHTTPRequestHandler):
             )
             return
         balance_sats = BALANCES.get(address, 0)
+        if balance_sats == 0:
+            balance_sats = _compute_balance(address)
         balance_btc = balance_sats / 100_000_000
         self._send_json(
             {
@@ -177,9 +312,114 @@ class AddressHandler(BaseHTTPRequestHandler):
             "block_hex": mined_block.serialize().hex(),
         }
         payout = sum(tx_out.amount for tx_out in coinbase_tx.tx_outs)
-        BALANCES[address] = BALANCES.get(address, 0) + payout
+        coinbase_utxo_id = f"{coinbase_tx.id()}:0"
+        UTXO_SET[coinbase_utxo_id] = {
+            "address": address,
+            "amount_sats": payout,
+        }
+        _persist_utxos()
+        _recalculate_balances()
         _persist_balances()
         self._send_json(result, status=201)
+
+    def _handle_send(self):
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            self._send_json({"error": "Invalid Content-Length"}, status=411)
+            return
+        raw_body = self.rfile.read(content_length) if content_length > 0 else b"{}"
+        try:
+            payload = json.loads(raw_body.decode("utf-8") or "{}")
+        except json.JSONDecodeError:
+            self._send_json({"error": "Invalid JSON body"}, status=400)
+            return
+
+        from_address = (payload.get("from_address") or "").strip()
+        to_address = (payload.get("to_address") or "").strip()
+        amount_raw = payload.get("amount_sats")
+        wif = (payload.get("wif") or "").strip()
+
+        if not from_address or not to_address:
+            self._send_json(
+                {"error": "from_address and to_address are required"}, status=400
+            )
+            return
+
+        try:
+            amount_sats = int(amount_raw)
+        except (TypeError, ValueError):
+            self._send_json({"error": "amount_sats must be an integer"}, status=400)
+            return
+        if amount_sats <= 0:
+            self._send_json({"error": "amount_sats must be positive"}, status=400)
+            return
+
+        if wif:
+            try:
+                priv, compressed, testnet = _wif_to_private_key(wif)
+            except ValueError as exc:
+                self._send_json({"error": f"Invalid WIF: {exc}"}, status=400)
+                return
+            derived_address = priv.point.address(compressed=compressed, testnet=testnet)
+            if derived_address != from_address:
+                self._send_json(
+                    {"error": "WIF does not correspond to from_address"}, status=400
+                )
+                return
+
+        selected_utxos, total_available = _select_utxos(from_address, amount_sats)
+        if total_available < amount_sats:
+            self._send_json({"error": "Insufficient balance"}, status=400)
+            return
+
+        change_sats = total_available - amount_sats
+
+        tx_payload = json.dumps(
+            {
+                "inputs": [utxo_id for utxo_id, _ in selected_utxos],
+                "from": from_address,
+                "to": to_address,
+                "amount": amount_sats,
+                "change": change_sats,
+                "timestamp": time.time(),
+                "salt": randint(0, N),
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+        txid = hash256(tx_payload).hex()
+
+        for utxo_id, _ in selected_utxos:
+            UTXO_SET.pop(utxo_id, None)
+
+        output_index = 0
+        UTXO_SET[f"{txid}:{output_index}"] = {
+            "address": to_address,
+            "amount_sats": amount_sats,
+        }
+        output_index += 1
+        if change_sats > 0:
+            UTXO_SET[f"{txid}:{output_index}"] = {
+                "address": from_address,
+                "amount_sats": change_sats,
+            }
+
+        _persist_utxos()
+        _recalculate_balances()
+        _persist_balances()
+
+
+        self._send_json(
+            {
+                "txid": txid,
+                "from_address": from_address,
+                "to_address": to_address,
+                "amount_sats": amount_sats,
+                "fee_sats": 0,
+                "note": "Simulated transaction recorded only in local ledger",
+            },
+            status=201,
+        )
 
     def _send_json(self, data, status=200):
         body = json.dumps(data).encode("utf-8")
