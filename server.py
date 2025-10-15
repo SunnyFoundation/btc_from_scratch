@@ -4,12 +4,14 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from io import BytesIO
 from pathlib import Path
 from random import randint
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 from Block import Block, build_candidate_block, mine_block
 from Ecc import N, PrivateKey
-from helper import BASE58_ALPHABET, encode_base58_checksum, hash256
+from Script import p2pkh_script
+from Tx import Tx, TxIn, TxOut
+from helper import BASE58_ALPHABET, decode_base58, encode_base58_checksum, hash256
 
 BLOCKCHAIN: List[Block] = []
 BALANCES: Dict[str, int] = {}
@@ -67,6 +69,45 @@ def _persist_balances():
         print(f"Warning: unable to write {BALANCES_FILE}: {err}")
 
 
+def _normalize_utxo_identifier(
+    utxo_id: str, txid: Optional[str], vout: Optional[int]
+) -> Tuple[Optional[str], Optional[int]]:
+    txid_candidate = txid if isinstance(txid, str) else None
+    if txid_candidate:
+        try:
+            _ = bytes.fromhex(txid_candidate)
+        except ValueError:
+            txid_candidate = None
+        else:
+            if len(txid_candidate) != 64:
+                txid_candidate = None
+
+    vout_candidate = vout if isinstance(vout, int) and vout >= 0 else None
+
+    if (txid_candidate is None or vout_candidate is None) and isinstance(utxo_id, str):
+        if ":" in utxo_id:
+            left, right = utxo_id.rsplit(":", 1)
+            if txid_candidate is None:
+                try:
+                    _ = bytes.fromhex(left)
+                except ValueError:
+                    txid_candidate = None
+                else:
+                    if len(left) == 64:
+                        txid_candidate = left
+            if vout_candidate is None:
+                try:
+                    vout_candidate = int(right)
+                except ValueError:
+                    vout_candidate = None
+
+    if txid_candidate is None:
+        txid_candidate = hash256(str(utxo_id).encode("utf-8")).hex()
+    if vout_candidate is None:
+        vout_candidate = 0
+    return txid_candidate, vout_candidate
+
+
 def _load_utxos_from_disk():
     if not UTXO_FILE.exists():
         return
@@ -79,30 +120,53 @@ def _load_utxos_from_disk():
         print(f"Warning: invalid utxo data in {UTXO_FILE}")
         return
     UTXO_SET.clear()
-    for utxo_id, entry in payload.items():
+    for orig_utxo_id, entry in payload.items():
         address = entry.get("address")
         amount = entry.get("amount_sats")
+        txid = entry.get("txid")
+        vout = entry.get("vout")
         if not isinstance(address, str):
-            print(f"Warning: skipping UTXO {utxo_id!r} due to invalid address")
+            print(f"Warning: skipping UTXO {orig_utxo_id!r} due to invalid address")
             continue
         try:
             amount_int = int(amount)
         except (TypeError, ValueError):
-            print(f"Warning: skipping UTXO {utxo_id!r} due to invalid amount")
+            print(f"Warning: skipping UTXO {orig_utxo_id!r} due to invalid amount")
             continue
         if amount_int <= 0:
             continue
-        UTXO_SET[utxo_id] = {"address": address, "amount_sats": amount_int}
+
+        txid_str, vout_int = _normalize_utxo_identifier(orig_utxo_id, txid, vout)
+        if txid_str is None:
+            print(f"Warning: skipping UTXO {orig_utxo_id!r} due to invalid txid/vout")
+            continue
+
+        utxo_key = f"{txid_str}:{vout_int}"
+        UTXO_SET[utxo_key] = {
+            "address": address,
+            "amount_sats": amount_int,
+            "txid": txid_str,
+            "vout": vout_int,
+        }
     if UTXO_SET:
         print(f"Loaded {len(UTXO_SET)} UTXO(s) from {UTXO_FILE}")
 
 
 def _persist_utxos():
     try:
-        data = {
-            utxo_id: {"address": utxo["address"], "amount_sats": utxo["amount_sats"]}
-            for utxo_id, utxo in UTXO_SET.items()
-        }
+        data = {}
+        for utxo_id, utxo in UTXO_SET.items():
+            txid = utxo.get("txid")
+            vout = utxo.get("vout")
+            if not isinstance(txid, str) or len(txid) != 64 or not isinstance(vout, int):
+                txid, vout = _normalize_utxo_identifier(utxo_id, txid, vout)
+            key = f"{txid}:{vout}"
+            data[key] = {
+                "address": utxo["address"],
+                "amount_sats": utxo["amount_sats"],
+                "txid": txid,
+                "vout": vout,
+            }
         UTXO_FILE.write_text(json.dumps(data, separators=(",", ":")))
     except OSError as err:
         print(f"Warning: unable to write {UTXO_FILE}: {err}")
@@ -122,8 +186,16 @@ def _bootstrap_utxos_from_balances():
     for index, (addr, amount) in enumerate(BALANCES.items()):
         if amount <= 0:
             continue
-        utxo_id = f"legacy-{index}"
-        UTXO_SET[utxo_id] = {"address": addr, "amount_sats": amount}
+        seed = f"legacy-{index}-{addr}".encode("utf-8")
+        txid = hash256(seed).hex()
+        vout = 0
+        utxo_key = f"{txid}:{vout}"
+        UTXO_SET[utxo_key] = {
+            "address": addr,
+            "amount_sats": amount,
+            "txid": txid,
+            "vout": vout,
+        }
     _persist_utxos()
 
 
@@ -312,10 +384,13 @@ class AddressHandler(BaseHTTPRequestHandler):
             "block_hex": mined_block.serialize().hex(),
         }
         payout = sum(tx_out.amount for tx_out in coinbase_tx.tx_outs)
-        coinbase_utxo_id = f"{coinbase_tx.id()}:0"
+        coinbase_txid = coinbase_tx.id()
+        coinbase_utxo_id = f"{coinbase_txid}:0"
         UTXO_SET[coinbase_utxo_id] = {
             "address": address,
             "amount_sats": payout,
+            "txid": coinbase_txid,
+            "vout": 0,
         }
         _persist_utxos()
         _recalculate_balances()
@@ -374,40 +449,67 @@ class AddressHandler(BaseHTTPRequestHandler):
             return
 
         change_sats = total_available - amount_sats
+        tx_ins: List[TxIn] = []
+        for utxo_id, utxo in selected_utxos:
+            txid_str, vout_index = _normalize_utxo_identifier(
+                utxo_id, utxo.get("txid"), utxo.get("vout")
+            )
+            if txid_str is None or vout_index is None:
+                self._send_json(
+                    {
+                        "error": f"Unable to use UTXO {utxo_id}: missing txid or index"
+                    },
+                    status=500,
+                )
+                return
+            try:
+                prev_tx_bytes = bytes.fromhex(txid_str)
+            except ValueError:
+                self._send_json(
+                    {"error": f"Unable to decode txid for UTXO {utxo_id}"},
+                    status=500,
+                )
+                return
+            tx_ins.append(TxIn(prev_tx=prev_tx_bytes, prev_index=vout_index))
 
-        tx_payload = json.dumps(
-            {
-                "inputs": [utxo_id for utxo_id, _ in selected_utxos],
-                "from": from_address,
-                "to": to_address,
-                "amount": amount_sats,
-                "change": change_sats,
-                "timestamp": time.time(),
-                "salt": randint(0, N),
-            },
-            sort_keys=True,
-        ).encode("utf-8")
-        txid = hash256(tx_payload).hex()
+        tx_outs: List[TxOut] = []
+        try:
+            to_h160 = decode_base58(to_address)
+        except ValueError:
+            self._send_json({"error": "Invalid destination address"}, status=400)
+            return
+        tx_outs.append(TxOut(amount_sats, p2pkh_script(to_h160)))
+
+        outputs_for_utxo = [(to_address, amount_sats)]
+
+        if change_sats > 0:
+            try:
+                change_h160 = decode_base58(from_address)
+            except ValueError:
+                self._send_json({"error": "Invalid change address"}, status=400)
+                return
+            tx_outs.append(TxOut(change_sats, p2pkh_script(change_h160)))
+            outputs_for_utxo.append((from_address, change_sats))
+
+        tx = Tx(version=1, tx_ins=tx_ins, tx_outs=tx_outs, locktime=0, testnet=True)
+        txid = tx.id()
 
         for utxo_id, _ in selected_utxos:
             UTXO_SET.pop(utxo_id, None)
 
-        output_index = 0
-        UTXO_SET[f"{txid}:{output_index}"] = {
-            "address": to_address,
-            "amount_sats": amount_sats,
-        }
-        output_index += 1
-        if change_sats > 0:
-            UTXO_SET[f"{txid}:{output_index}"] = {
-                "address": from_address,
-                "amount_sats": change_sats,
+        for output_index, (addr, amt) in enumerate(outputs_for_utxo):
+            utxo_key = f"{txid}:{output_index}"
+            UTXO_SET[utxo_key] = {
+                "address": addr,
+                "amount_sats": amt,
+                "txid": txid,
+                "vout": output_index,
             }
 
+        raw_tx_hex = tx.serialize().hex()
         _persist_utxos()
         _recalculate_balances()
         _persist_balances()
-
 
         self._send_json(
             {
@@ -416,6 +518,7 @@ class AddressHandler(BaseHTTPRequestHandler):
                 "to_address": to_address,
                 "amount_sats": amount_sats,
                 "fee_sats": 0,
+                "raw_tx_hex": raw_tx_hex,
                 "note": "Simulated transaction recorded only in local ledger",
             },
             status=201,
