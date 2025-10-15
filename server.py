@@ -20,7 +20,7 @@ from helper import (
     encode_base58_checksum,
     hash256,
 )
-from p2p import DEFAULT_P2P_PORT, DEFAULT_LISTEN_HOST, PeerManager
+from p2p import DEFAULT_LISTEN_HOST, DEFAULT_P2P_PORT, PeerManager
 
 BLOCKCHAIN: List[Block] = []
 BALANCES: Dict[str, int] = {}
@@ -441,8 +441,8 @@ _bootstrap_utxos_from_balances()
 _recalculate_balances()
 
 
-HOST = "127.0.0.1"
-PORT = 8765
+HOST = os.environ.get("SUNNY_HTTP_HOST", "0.0.0.0")
+PORT = int(os.environ.get("SUNNY_HTTP_PORT", "8765"))
 
 
 class AddressHandler(BaseHTTPRequestHandler):
@@ -457,6 +457,9 @@ class AddressHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/balance":
             self._handle_balance(parsed)
+            return
+        if parsed.path == "/mempool":
+            self._handle_mempool()
             return
         self._send_json({"error": "Not found"}, status=404)
 
@@ -508,6 +511,20 @@ class AddressHandler(BaseHTTPRequestHandler):
                 "balance_btc": balance_btc,
             }
         )
+
+    def _handle_mempool(self):
+        entries = []
+        for txid, info in MEMPOOL.items():
+            entries.append(
+                {
+                    "txid": txid,
+                    "fee_sats": info.get("fee_sats"),
+                    "received_at": info.get("received_at"),
+                    "inputs": info.get("inputs", []),
+                    "outputs": info.get("outputs", []),
+                }
+            )
+        self._send_json({"mempool": entries})
 
     def _handle_mine(self):
         try:
@@ -758,8 +775,6 @@ class AddressHandler(BaseHTTPRequestHandler):
         result_payload = result_payload or {}
         if stored_hex is None and raw_tx_hex:
             stored_hex = raw_tx_hex
-        if stored_hex:
-            result_payload.setdefault("raw_tx_hex", stored_hex)
 
         if status == "error":
             self._send_json(result_payload, status=status_code)
