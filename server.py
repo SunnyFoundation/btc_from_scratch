@@ -9,9 +9,15 @@ from urllib.parse import parse_qs, urlparse
 
 from Block import Block, build_candidate_block, mine_block
 from Ecc import N, PrivateKey
-from Script import p2pkh_script
+from Script import Script, p2pkh_script
 from Tx import Tx, TxIn, TxOut
-from helper import BASE58_ALPHABET, decode_base58, encode_base58_checksum, hash256
+from helper import (
+    BASE58_ALPHABET,
+    SIGHASH_ALL,
+    decode_base58,
+    encode_base58_checksum,
+    hash256,
+)
 
 BLOCKCHAIN: List[Block] = []
 BALANCES: Dict[str, int] = {}
@@ -430,18 +436,32 @@ class AddressHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "amount_sats must be positive"}, status=400)
             return
 
-        if wif:
-            try:
-                priv, compressed, testnet = _wif_to_private_key(wif)
-            except ValueError as exc:
-                self._send_json({"error": f"Invalid WIF: {exc}"}, status=400)
-                return
-            derived_address = priv.point.address(compressed=compressed, testnet=testnet)
-            if derived_address != from_address:
-                self._send_json(
-                    {"error": "WIF does not correspond to from_address"}, status=400
-                )
-                return
+        if not wif:
+            self._send_json({"error": "wif is required to sign transaction"}, status=400)
+            return
+
+        try:
+            priv, compressed, testnet = _wif_to_private_key(wif)
+        except ValueError as exc:
+            self._send_json({"error": f"Invalid WIF: {exc}"}, status=400)
+            return
+
+        if not testnet:
+            self._send_json({"error": "Only testnet WIF keys are supported"}, status=400)
+            return
+
+        derived_address = priv.point.address(compressed=compressed, testnet=testnet)
+        if derived_address != from_address:
+            self._send_json(
+                {"error": "WIF does not correspond to from_address"}, status=400
+            )
+            return
+
+        try:
+            from_h160 = decode_base58(from_address)
+        except ValueError:
+            self._send_json({"error": "Invalid sender address"}, status=400)
+            return
 
         selected_utxos, total_available = _select_utxos(from_address, amount_sats)
         if total_available < amount_sats:
@@ -450,6 +470,7 @@ class AddressHandler(BaseHTTPRequestHandler):
 
         change_sats = total_available - amount_sats
         tx_ins: List[TxIn] = []
+        script_pubkeys: List[Script] = []
         for utxo_id, utxo in selected_utxos:
             txid_str, vout_index = _normalize_utxo_identifier(
                 utxo_id, utxo.get("txid"), utxo.get("vout")
@@ -471,6 +492,22 @@ class AddressHandler(BaseHTTPRequestHandler):
                 )
                 return
             tx_ins.append(TxIn(prev_tx=prev_tx_bytes, prev_index=vout_index))
+            utxo_address = utxo.get("address")
+            if not isinstance(utxo_address, str):
+                self._send_json(
+                    {"error": f"UTXO {utxo_id} missing address information"},
+                    status=500,
+                )
+                return
+            try:
+                utxo_h160 = decode_base58(utxo_address)
+            except ValueError:
+                self._send_json(
+                    {"error": f"Stored address for UTXO {utxo_id} is invalid"},
+                    status=500,
+                )
+                return
+            script_pubkeys.append(p2pkh_script(utxo_h160))
 
         tx_outs: List[TxOut] = []
         try:
@@ -483,15 +520,29 @@ class AddressHandler(BaseHTTPRequestHandler):
         outputs_for_utxo = [(to_address, amount_sats)]
 
         if change_sats > 0:
-            try:
-                change_h160 = decode_base58(from_address)
-            except ValueError:
-                self._send_json({"error": "Invalid change address"}, status=400)
-                return
+            change_h160 = from_h160
             tx_outs.append(TxOut(change_sats, p2pkh_script(change_h160)))
             outputs_for_utxo.append((from_address, change_sats))
 
         tx = Tx(version=1, tx_ins=tx_ins, tx_outs=tx_outs, locktime=0, testnet=True)
+        for idx, script in enumerate(script_pubkeys):
+            tx.tx_ins[idx].script_pubkey = (  # type: ignore[attr-defined]
+                lambda testnet=True, script=script: script
+            )
+
+        for idx, script in enumerate(script_pubkeys):
+            z = tx.sig_hash(idx)
+            der = priv.sign(z).der()
+            sig = der + SIGHASH_ALL.to_bytes(1, "big")
+            sec = priv.point.sec(compressed=compressed)
+            tx.tx_ins[idx].script_sig = Script([sig, sec])
+            combined_script = tx.tx_ins[idx].script_sig + script
+            if not combined_script.evaluate(z):
+                self._send_json(
+                    {"error": "Internal signature verification failed"}, status=500
+                )
+                return
+
         txid = tx.id()
 
         for utxo_id, _ in selected_utxos:
