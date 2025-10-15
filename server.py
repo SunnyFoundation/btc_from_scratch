@@ -8,6 +8,7 @@ from urllib.parse import parse_qs, urlparse
 
 from Block import Block, build_candidate_block, mine_block
 from Ecc import N, PrivateKey
+from helper import encode_base58_checksum
 
 BLOCKCHAIN: List[Block] = []
 BALANCES: Dict[str, int] = {}
@@ -103,7 +104,8 @@ class AddressHandler(BaseHTTPRequestHandler):
         secret = randint(1, N - 1)
         priv = PrivateKey(secret)
         address = priv.point.address(compressed=True, testnet=True)
-        self._send_json({"address": address, "secret_hex": priv.hex()})
+        wif = self._private_key_to_wif(priv, compressed=True, testnet=True)
+        self._send_json({"address": address, "secret_hex": priv.hex(), "wif": wif})
 
     def _handle_balance(self, parsed):
         query = parse_qs(parsed.query)
@@ -187,6 +189,13 @@ class AddressHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
+
+    @staticmethod
+    def _private_key_to_wif(priv, *, compressed=True, testnet=True):
+        prefix = b"\xEF" if testnet else b"\x80"
+        suffix = b"\x01" if compressed else b""
+        secret_bytes = priv.secret.to_bytes(32, "big")
+        return encode_base58_checksum(prefix + secret_bytes + suffix)
 
 
 if __name__ == "__main__":
