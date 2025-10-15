@@ -1,4 +1,6 @@
 import json
+import os
+import secrets
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from io import BytesIO
@@ -18,14 +20,19 @@ from helper import (
     encode_base58_checksum,
     hash256,
 )
+from p2p import DEFAULT_P2P_PORT, DEFAULT_LISTEN_HOST, PeerManager
 
 BLOCKCHAIN: List[Block] = []
 BALANCES: Dict[str, int] = {}
 UTXO_SET: Dict[str, Dict[str, int]] = {}
+MEMPOOL: Dict[str, Dict] = {}
 
 CHAIN_FILE = Path("genesis_block.bin")
 BALANCES_FILE = Path("balances.json")
 UTXO_FILE = Path("utxos.json")
+
+NODE_ID = os.environ.get("SUNNY_NODE_ID") or secrets.token_hex(8)
+P2P_MANAGER: Optional[PeerManager] = None
 
 
 def _load_blockchain_from_disk():
@@ -226,6 +233,164 @@ def _select_utxos(address: str, target_amount: int) -> Tuple[List[Tuple[str, Dic
     return gathered, total
 
 
+def _apply_transaction(
+    tx: Tx,
+    script_pubkeys: List[Script],
+    *,
+    expect_signed: bool = True,
+) -> Tuple[int, List[Tuple[str, int]]]:
+    if expect_signed:
+        for idx, script in enumerate(script_pubkeys):
+            z = tx.sig_hash(idx)
+            combined_script = tx.tx_ins[idx].script_sig + script
+            if not combined_script.evaluate(z):
+                raise ValueError("Signature verification failed")
+
+    total_out = 0
+    outputs_for_utxo: List[Tuple[str, int]] = []
+    for tx_out in tx.tx_outs:
+        try:
+            cmds = tx_out.script_pubkey.cmds
+        except AttributeError as exc:
+            raise ValueError("Invalid TxOut script") from exc
+        if len(cmds) != 5 or cmds[0] != 0x76 or cmds[1] != 0xA9:
+            raise ValueError("Only p2pkh outputs supported")
+        h160 = cmds[2]
+        if not isinstance(h160, bytes):
+            raise ValueError("Invalid script command in TxOut")
+        address = encode_base58_checksum(b"\x6f" + h160)
+        amount = tx_out.amount
+        if not isinstance(amount, int) or amount <= 0:
+            raise ValueError("Invalid TxOut amount")
+        total_out += amount
+        outputs_for_utxo.append((address, amount))
+    return total_out, outputs_for_utxo
+
+
+def _extract_input_scripts(tx: Tx) -> List[Script]:
+    scripts: List[Script] = []
+    for tx_in in tx.tx_ins:
+        prev_txid = tx_in.prev_tx.hex()
+        key = f"{prev_txid}:{tx_in.prev_index}"
+        utxo = UTXO_SET.get(key)
+        if utxo is None:
+            raise ValueError(f"Unknown UTXO referenced: {key}")
+        address = utxo.get("address")
+        if not isinstance(address, str):
+            raise ValueError(f"Stored UTXO missing address: {key}")
+        try:
+            h160 = decode_base58(address)
+        except ValueError as exc:
+            raise ValueError(f"Invalid address in UTXO {key}") from exc
+        scripts.append(p2pkh_script(h160))
+    return scripts
+
+
+def _status_error(message: str, http_status: int):
+    return "error", {"error": message}, http_status, None, None
+
+
+def _accept_transaction(
+    raw_tx_hex: str,
+    *,
+    origin: Optional[str] = None,
+) -> Tuple[str, Dict, int, Optional[str], Optional[str]]:
+    raw_tx_hex = (raw_tx_hex or "").strip()
+    if not raw_tx_hex:
+        return _status_error("raw_tx_hex is required", 400)
+    try:
+        tx_bytes = bytes.fromhex(raw_tx_hex)
+    except ValueError:
+        return _status_error("raw_tx_hex must be valid hex", 400)
+
+    try:
+        tx = Tx.parse(BytesIO(tx_bytes), testnet=True)
+    except Exception as exc:  # noqa: BLE001
+        return _status_error(f"Unable to parse transaction: {exc}", 400)
+
+    txid = tx.id()
+    if txid in MEMPOOL:
+        payload = {"status": "duplicate", "txid": txid}
+        return "duplicate", payload, 200, txid, raw_tx_hex
+
+    try:
+        script_pubkeys = _extract_input_scripts(tx)
+    except ValueError as exc:
+        message = str(exc)
+        status_code = 404 if message.startswith("Unknown UTXO") else 400
+        return _status_error(message, status_code)
+
+    for idx, script in enumerate(script_pubkeys):
+        tx.tx_ins[idx].script_pubkey = (  # type: ignore[attr-defined]
+            lambda testnet=True, script=script: script
+        )
+
+    spent_outpoints = set()
+    total_in = 0
+    inputs_info = []
+    for tx_in in tx.tx_ins:
+        prev_txid = tx_in.prev_tx.hex()
+        key = f"{prev_txid}:{tx_in.prev_index}"
+        utxo = UTXO_SET.get(key)
+        if utxo is None:
+            return _status_error(f"Unknown UTXO referenced: {key}", 404)
+        total_in += utxo["amount_sats"]
+        inputs_info.append(
+            {
+                "txid": utxo.get("txid", prev_txid),
+                "vout": utxo.get("vout", tx_in.prev_index),
+                "amount_sats": utxo["amount_sats"],
+                "address": utxo["address"],
+            }
+        )
+        spent_outpoints.add(key)
+
+    for existing in MEMPOOL.values():
+        for entry in existing.get("inputs", []):
+            if f"{entry['txid']}:{entry['vout']}" in spent_outpoints:
+                return _status_error(
+                    "Input already spent by mempool transaction", 409
+                )
+
+    try:
+        total_out, outputs_for_utxo = _apply_transaction(
+            tx, script_pubkeys, expect_signed=True
+        )
+    except ValueError as exc:
+        return _status_error(str(exc), 400)
+
+    fee = total_in - total_out
+    if fee < 0:
+        return _status_error("Transaction outputs exceed inputs", 400)
+
+    MEMPOOL[txid] = {
+        "tx_hex": raw_tx_hex,
+        "inputs": inputs_info,
+        "outputs": [
+            {"address": addr, "amount_sats": amt} for addr, amt in outputs_for_utxo
+        ],
+        "fee_sats": fee,
+        "received_at": time.time(),
+        "origin": origin or NODE_ID,
+    }
+
+    payload = {
+        "status": "accepted",
+        "txid": txid,
+        "fee_sats": fee,
+        "mempool_size": len(MEMPOOL),
+    }
+    return "accepted", payload, 202, txid, raw_tx_hex
+
+
+def _handle_incoming_tx_from_peer(raw_tx_hex: str, origin: Optional[str]) -> None:
+    status, _, _, _, stored_hex = _accept_transaction(raw_tx_hex, origin=origin)
+    if status != "accepted":
+        return
+    if P2P_MANAGER is not None:
+        P2P_MANAGER.broadcast_tx(stored_hex or raw_tx_hex, origin=origin)
+
+
 def _decode_base58_with_checksum(s: str) -> bytes:
     num = 0
     for c in s:
@@ -304,6 +469,12 @@ class AddressHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/send":
             self._handle_send()
+            return
+        if self.path == "/broadcast-tx":
+            self._handle_broadcast_tx()
+            return
+        if self.path == "/broadcast-block":
+            self._handle_broadcast_block()
             return
 
         self._send_json({"error": "Not found"}, status=404)
@@ -517,12 +688,9 @@ class AddressHandler(BaseHTTPRequestHandler):
             return
         tx_outs.append(TxOut(amount_sats, p2pkh_script(to_h160)))
 
-        outputs_for_utxo = [(to_address, amount_sats)]
-
         if change_sats > 0:
             change_h160 = from_h160
             tx_outs.append(TxOut(change_sats, p2pkh_script(change_h160)))
-            outputs_for_utxo.append((from_address, change_sats))
 
         tx = Tx(version=1, tx_ins=tx_ins, tx_outs=tx_outs, locktime=0, testnet=True)
         for idx, script in enumerate(script_pubkeys):
@@ -543,36 +711,129 @@ class AddressHandler(BaseHTTPRequestHandler):
                 )
                 return
 
-        txid = tx.id()
-
-        for utxo_id, _ in selected_utxos:
-            UTXO_SET.pop(utxo_id, None)
-
-        for output_index, (addr, amt) in enumerate(outputs_for_utxo):
-            utxo_key = f"{txid}:{output_index}"
-            UTXO_SET[utxo_key] = {
-                "address": addr,
-                "amount_sats": amt,
-                "txid": txid,
-                "vout": output_index,
-            }
-
         raw_tx_hex = tx.serialize().hex()
-        _persist_utxos()
-        _recalculate_balances()
-        _persist_balances()
+        status, payload, status_code, txid, _ = _accept_transaction(
+            raw_tx_hex, origin=NODE_ID
+        )
+        if status == "error":
+            self._send_json(payload, status=status_code)
+            return
+        if status == "duplicate":
+            payload["raw_tx_hex"] = raw_tx_hex
+            self._send_json(payload, status=status_code)
+            return
+
+        if P2P_MANAGER is not None:
+            P2P_MANAGER.broadcast_tx(raw_tx_hex)
+
+        response = {
+            "txid": txid,
+            "from_address": from_address,
+            "to_address": to_address,
+            "amount_sats": amount_sats,
+            "fee_sats": payload.get("fee_sats", 0),
+            "raw_tx_hex": raw_tx_hex,
+            "note": "Transaction signed and stored in mempool; broadcasted to peers if configured",
+        }
+        self._send_json(response, status=201)
+
+    def _handle_broadcast_tx(self):
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            self._send_json({"error": "Invalid Content-Length"}, status=411)
+            return
+        raw_body = self.rfile.read(content_length) if content_length > 0 else b"{}"
+        try:
+            payload = json.loads(raw_body.decode("utf-8") or "{}")
+        except json.JSONDecodeError:
+            self._send_json({"error": "Invalid JSON body"}, status=400)
+            return
+
+        raw_tx_hex = (payload.get("raw_tx_hex") or payload.get("tx_hex") or "").strip()
+        origin_id = payload.get("origin")
+        status, result_payload, status_code, txid, stored_hex = _accept_transaction(
+            raw_tx_hex, origin=origin_id
+        )
+        result_payload = result_payload or {}
+        if stored_hex is None and raw_tx_hex:
+            stored_hex = raw_tx_hex
+        if stored_hex:
+            result_payload.setdefault("raw_tx_hex", stored_hex)
+
+        if status == "error":
+            self._send_json(result_payload, status=status_code)
+            return
+
+        if status == "duplicate":
+            self._send_json(result_payload, status=status_code)
+            return
+
+        broadcast_origin = origin_id or NODE_ID
+        if P2P_MANAGER is not None:
+            P2P_MANAGER.broadcast_tx(stored_hex, origin=broadcast_origin)
+
+        self._send_json(result_payload, status=status_code)
+
+    def _handle_broadcast_block(self):
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            self._send_json({"error": "Invalid Content-Length"}, status=411)
+            return
+        raw_body = self.rfile.read(content_length) if content_length > 0 else b"{}"
+        try:
+            payload = json.loads(raw_body.decode("utf-8") or "{}")
+        except json.JSONDecodeError:
+            self._send_json({"error": "Invalid JSON body"}, status=400)
+            return
+
+        block_hex = (payload.get("block_hex") or "").strip()
+        if not block_hex:
+            self._send_json({"error": "block_hex is required"}, status=400)
+            return
+
+        try:
+            block_bytes = bytes.fromhex(block_hex)
+        except ValueError:
+            self._send_json({"error": "block_hex must be valid hex"}, status=400)
+            return
+
+        if len(block_bytes) != 80:
+            self._send_json({"error": "Only 80-byte block headers supported"}, status=400)
+            return
+
+        block = Block.parse(BytesIO(block_bytes))
+        if not block.check_pow():
+            self._send_json({"error": "Invalid proof-of-work"}, status=400)
+            return
+
+        prev_hash = block.prev_block.hex()
+        expected_prev = (
+            BLOCKCHAIN[-1].hash().hex() if BLOCKCHAIN else "00" * 32
+        )
+        if prev_hash != expected_prev:
+            self._send_json(
+                {
+                    "error": "Block does not extend current chain",
+                    "expected_prev": expected_prev,
+                    "provided_prev": prev_hash,
+                },
+                status=409,
+            )
+            return
+
+        BLOCKCHAIN.append(block)
+        try:
+            with open("genesis_block.bin", "ab") as f:
+                f.write(block.serialize())
+        except OSError as err:
+            self._send_json({"error": f"Failed to persist block: {err}"}, status=500)
+            return
 
         self._send_json(
-            {
-                "txid": txid,
-                "from_address": from_address,
-                "to_address": to_address,
-                "amount_sats": amount_sats,
-                "fee_sats": 0,
-                "raw_tx_hex": raw_tx_hex,
-                "note": "Simulated transaction recorded only in local ledger",
-            },
-            status=201,
+            {"status": "accepted", "height": len(BLOCKCHAIN) - 1, "hash": block.hash().hex()},
+            status=202,
         )
 
     def _send_json(self, data, status=200):
@@ -593,10 +854,23 @@ class AddressHandler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    HTTPServer((HOST, PORT), AddressHandler).serve_forever()
+    try:
+        listen_host = os.environ.get("SUNNY_P2P_HOST", DEFAULT_LISTEN_HOST)
+        listen_port = int(os.environ.get("SUNNY_P2P_PORT", str(DEFAULT_P2P_PORT)))
+        P2P_MANAGER = PeerManager(
+            NODE_ID,
+            listen_host=listen_host,
+            listen_port=listen_port,
+            on_tx=_handle_incoming_tx_from_peer,
+        )
+        P2P_MANAGER.start()
+        print(f"[P2P] node_id={NODE_ID} listening on {listen_host}:{listen_port}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"Warning: unable to start P2P server: {exc}")
+        P2P_MANAGER = None
 
-
-# git remote add origin https://github.com/SunnyFoundation/btc_from_scratch.git
-
-
-# mkaBghpnXRyKQWD47d1RCz2rx3b2gbSQZT
+    try:
+        HTTPServer((HOST, PORT), AddressHandler).serve_forever()
+    finally:
+        if P2P_MANAGER is not None:
+            P2P_MANAGER.stop()
