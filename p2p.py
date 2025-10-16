@@ -47,11 +47,13 @@ class PeerManager:
         listen_port: int = DEFAULT_P2P_PORT,
         peers: Optional[Iterable[Dict[str, int]]] = None,
         on_tx: Optional[Callable[[str, Optional[str]], None]] = None,
+        on_block: Optional[Callable[[Dict, Optional[str]], None]] = None,
     ) -> None:
         self.node_id = node_id
         self.listen_host = listen_host
         self.listen_port = listen_port
         self.on_tx = on_tx
+        self.on_block = on_block
         self._server_socket: Optional[socket.socket] = None
         self._server_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
@@ -81,11 +83,8 @@ class PeerManager:
                 pass
             self._server_socket = None
 
-    def broadcast_tx(self, raw_tx_hex: str, origin: Optional[str] = None) -> None:
-        if not raw_tx_hex:
-            return
-        origin_id = origin or self.node_id
-        message = _encode_message({"type": "tx", "tx_hex": raw_tx_hex, "origin": origin_id})
+    def _broadcast(self, message: Dict) -> None:
+        data = _encode_message(message)
         for peer in self.peers:
             host = peer.get("host")
             port = peer.get("port")
@@ -95,9 +94,23 @@ class PeerManager:
                 continue
             try:
                 with socket.create_connection((host, port), timeout=3) as sock:
-                    sock.sendall(message)
+                    sock.sendall(data)
             except OSError:
                 continue
+
+    def broadcast_tx(self, raw_tx_hex: str, origin: Optional[str] = None) -> None:
+        if not raw_tx_hex:
+            return
+        origin_id = origin or self.node_id
+        self._broadcast({"type": "tx", "tx_hex": raw_tx_hex, "origin": origin_id})
+
+    def broadcast_block(self, block_message: Dict, origin: Optional[str] = None) -> None:
+        if not isinstance(block_message, dict):
+            return
+        block_message = dict(block_message)  # copy
+        block_message["type"] = "block"
+        block_message["origin"] = origin or self.node_id
+        self._broadcast(block_message)
 
     def _server_loop(self) -> None:
         assert self._server_socket is not None
@@ -145,11 +158,27 @@ class PeerManager:
         if not isinstance(message, dict):
             return
         msg_type = message.get("type")
-        if msg_type != "tx":
-            return
-        raw_tx_hex = message.get("tx_hex")
-        if not isinstance(raw_tx_hex, str):
-            return
+        if msg_type == "tx":
+            raw_tx_hex = message.get("tx_hex")
+            if not isinstance(raw_tx_hex, str):
+                return
+            origin = message.get("origin")
+            if isinstance(origin, str) and origin == self.node_id:
+                return
+            if self.on_tx:
+                try:
+                    self.on_tx(raw_tx_hex, origin if isinstance(origin, str) else None)
+                except Exception:
+                    pass
+        elif msg_type == "block":
+            origin = message.get("origin")
+            if isinstance(origin, str) and origin == self.node_id:
+                return
+            if self.on_block and isinstance(message, dict):
+                try:
+                    self.on_block(message, origin if isinstance(origin, str) else None)
+                except Exception:
+                    pass
         origin = message.get("origin")
         if isinstance(origin, str) and origin == self.node_id:
             return

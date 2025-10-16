@@ -19,8 +19,10 @@ from helper import (
     decode_base58,
     encode_base58_checksum,
     hash256,
+    merkle_root,
 )
-from p2p import DEFAULT_LISTEN_HOST, DEFAULT_P2P_PORT, PeerManager
+from p2p import DEFAULT_LISTEN_HOST, DEFAULT_P2P_PORT, PeerManager, _load_peer_list
+import requests
 
 BLOCKCHAIN: List[Block] = []
 BALANCES: Dict[str, int] = {}
@@ -36,6 +38,7 @@ P2P_MANAGER: Optional[PeerManager] = None
 
 
 def _load_blockchain_from_disk():
+    BLOCKCHAIN.clear()
     if not CHAIN_FILE.exists():
         return
     try:
@@ -56,6 +59,7 @@ def _load_blockchain_from_disk():
 
 
 def _load_balances_from_disk():
+    BALANCES.clear()
     if not BALANCES_FILE.exists():
         return
     try:
@@ -417,6 +421,188 @@ def _apply_confirmed_transaction(tx: Tx) -> None:
         }
 
 
+def _handle_incoming_block_from_peer(message: Dict, origin: Optional[str]) -> None:
+    if not isinstance(message, dict):
+        return
+    block_hex = message.get("block_hex")
+    coinbase_hex = message.get("coinbase_tx")
+    tx_hexes = message.get("transactions") or []
+    if not isinstance(block_hex, str) or not isinstance(coinbase_hex, str):
+        return
+    try:
+        block_bytes = bytes.fromhex(block_hex)
+        block = Block.parse(BytesIO(block_bytes))
+    except Exception:
+        return
+
+    block_hash = block.hash().hex()
+    if any(existing.hash().hex() == block_hash for existing in BLOCKCHAIN):
+        return
+
+    if BLOCKCHAIN:
+        expected_prev = BLOCKCHAIN[-1].hash()[::-1]
+        if block.prev_block != expected_prev:
+            return
+    else:
+        if block.prev_block != b"\x00" * 32:
+            return
+
+    try:
+        coinbase_tx = Tx.parse(BytesIO(bytes.fromhex(coinbase_hex)), testnet=True)
+    except Exception:
+        return
+
+    transactions: List[Tx] = []
+    spent_in_block = set()
+    for tx_hex in tx_hexes:
+        if not isinstance(tx_hex, str):
+            return
+        try:
+            tx = Tx.parse(BytesIO(bytes.fromhex(tx_hex)), testnet=True)
+        except Exception:
+            return
+        try:
+            script_pubkeys = _extract_input_scripts(tx)
+        except ValueError:
+            return
+
+        for idx, script in enumerate(script_pubkeys):
+            tx.tx_ins[idx].script_pubkey = (  # type: ignore[attr-defined]
+                lambda testnet=True, script=script: script
+            )
+
+        temp_spent = [f"{tx_in.prev_tx.hex()}:{tx_in.prev_index}" for tx_in in tx.tx_ins]
+        if any(entry in spent_in_block for entry in temp_spent):
+            return
+
+        for idx, script in enumerate(script_pubkeys):
+            z = tx.sig_hash(idx)
+            combined = tx.tx_ins[idx].script_sig + script
+            if not combined.evaluate(z):
+                return
+
+        spent_in_block.update(temp_spent)
+        transactions.append(tx)
+
+    all_txs = [coinbase_tx] + transactions
+    tx_hashes_be = [bytes.fromhex(tx.id()) for tx in all_txs]
+    if merkle_root(tx_hashes_be)[::-1] != block.merkle_root_bytes:
+        return
+    block.tx_hashes = [h[::-1] for h in tx_hashes_be]
+
+    BLOCKCHAIN.append(block)
+    with open("genesis_block.bin", "ab") as f:
+        f.write(block.serialize())
+
+    _apply_confirmed_transaction(coinbase_tx)
+    for tx in transactions:
+        _apply_confirmed_transaction(tx)
+        MEMPOOL.pop(tx.id(), None)
+
+    _persist_utxos()
+    _recalculate_balances()
+    _persist_balances()
+
+    if P2P_MANAGER is not None:
+        P2P_MANAGER.broadcast_block(message, origin=origin or NODE_ID)
+
+
+def _apply_sync_snapshot(snapshot: Dict) -> bool:
+    chain_hex = snapshot.get("chain_hex")
+    utxos = snapshot.get("utxos")
+    balances = snapshot.get("balances")
+    if not isinstance(chain_hex, str) or not isinstance(utxos, dict) or not isinstance(balances, dict):
+        return False
+
+    try:
+        chain_bytes = bytes.fromhex(chain_hex)
+    except ValueError:
+        return False
+
+    normalized_utxos: Dict[str, Dict[str, int]] = {}
+    for key, entry in utxos.items():
+        if not isinstance(entry, dict):
+            continue
+        address = entry.get("address")
+        amount = entry.get("amount_sats")
+        txid = entry.get("txid")
+        vout = entry.get("vout")
+        if not isinstance(address, str) or not isinstance(txid, str):
+            continue
+        try:
+            amount_int = int(amount)
+            vout_int = int(vout)
+        except (TypeError, ValueError):
+            continue
+        normalized_utxos[key] = {
+            "address": address,
+            "amount_sats": amount_int,
+            "txid": txid,
+            "vout": vout_int,
+        }
+
+    normalized_balances: Dict[str, int] = {}
+    for key, value in balances.items():
+        try:
+            normalized_balances[key] = int(value)
+        except (TypeError, ValueError):
+            continue
+
+    try:
+        CHAIN_FILE.write_bytes(chain_bytes)
+        UTXO_FILE.write_text(json.dumps(normalized_utxos, separators=(",", ":")))
+        BALANCES_FILE.write_text(json.dumps(normalized_balances, separators=(",", ":")))
+    except OSError as err:
+        print(f"[SYNC] failed to write snapshot: {err}")
+        return False
+
+    BLOCKCHAIN.clear()
+    _load_blockchain_from_disk()
+    UTXO_SET.clear()
+    _load_utxos_from_disk()
+    BALANCES.clear()
+    _load_balances_from_disk()
+    _recalculate_balances()
+    MEMPOOL.clear()
+    print(f"[SYNC] synced chain height {len(BLOCKCHAIN) - 1}")
+    return True
+
+
+def _attempt_sync_from_peers():
+    peers = _load_peer_list(DEFAULT_LISTEN_HOST, DEFAULT_P2P_PORT)
+    if not peers:
+        return
+    local_height = len(BLOCKCHAIN) - 1
+    default_http_port = int(os.environ.get("SUNNY_HTTP_PORT", "8765"))
+    for peer in peers:
+        host = peer.get("host")
+        if not isinstance(host, str):
+            continue
+        http_port = peer.get("http_port")
+        try:
+            http_port = int(http_port)
+        except (TypeError, ValueError):
+            http_port = default_http_port
+        url = f"http://{host}:{http_port}/chain"
+        try:
+            response = requests.get(url, timeout=5)
+        except requests.RequestException:
+            continue
+        if response.status_code != 200:
+            continue
+        try:
+            payload = response.json()
+        except json.JSONDecodeError:
+            continue
+        remote_height = payload.get("height", -1)
+        if not isinstance(remote_height, int):
+            continue
+        if remote_height <= local_height:
+            continue
+        if _apply_sync_snapshot(payload):
+            break
+
+
 def _decode_base58_with_checksum(s: str) -> bytes:
     num = 0
     for c in s:
@@ -484,6 +670,9 @@ class AddressHandler(BaseHTTPRequestHandler):
         if parsed.path == "/balance":
             self._handle_balance(parsed)
             return
+        if parsed.path == "/chain":
+            self._handle_chain()
+            return
         if parsed.path == "/mempool":
             self._handle_mempool()
             return
@@ -537,6 +726,19 @@ class AddressHandler(BaseHTTPRequestHandler):
                 "balance_btc": balance_btc,
             }
         )
+
+    def _handle_chain(self):
+        try:
+            chain_bytes = CHAIN_FILE.read_bytes()
+        except OSError:
+            chain_bytes = b""
+        data = {
+            "height": len(BLOCKCHAIN) - 1,
+            "chain_hex": chain_bytes.hex(),
+            "utxos": UTXO_SET,
+            "balances": BALANCES,
+        }
+        self._send_json(data)
 
     def _handle_mempool(self):
         entries = []
@@ -674,6 +876,15 @@ class AddressHandler(BaseHTTPRequestHandler):
         _persist_utxos()
         _recalculate_balances()
         _persist_balances()
+
+        block_message = {
+            "block_hex": mined_block.serialize().hex(),
+            "transactions": [tx.serialize().hex() for tx in selected_txs],
+            "coinbase_tx": coinbase_tx.serialize().hex(),
+            "height": height,
+        }
+        if P2P_MANAGER is not None:
+            P2P_MANAGER.broadcast_block(block_message, origin=NODE_ID)
 
         result["tx_count"] = len(selected_txs)
         result["fees_sats"] = total_fees
@@ -897,6 +1108,28 @@ class AddressHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "block_hex is required"}, status=400)
             return
 
+        if "coinbase_tx" in payload:
+            message = {
+                "block_hex": block_hex,
+                "coinbase_tx": payload.get("coinbase_tx"),
+                "transactions": payload.get("transactions") or [],
+                "height": payload.get("height"),
+            }
+            previous_height = len(BLOCKCHAIN)
+            _handle_incoming_block_from_peer(message, origin=payload.get("origin"))
+            if len(BLOCKCHAIN) > previous_height:
+                self._send_json(
+                    {
+                        "status": "accepted",
+                        "height": len(BLOCKCHAIN) - 1,
+                        "hash": BLOCKCHAIN[-1].hash().hex(),
+                    },
+                    status=202,
+                )
+            else:
+                self._send_json({"status": "ignored"}, status=200)
+            return
+
         try:
             block_bytes = bytes.fromhex(block_hex)
         except ValueError:
@@ -959,6 +1192,10 @@ class AddressHandler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     try:
+        _attempt_sync_from_peers()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[SYNC] initial sync failed: {exc}")
+    try:
         listen_host = os.environ.get("SUNNY_P2P_HOST", DEFAULT_LISTEN_HOST)
         listen_port = int(os.environ.get("SUNNY_P2P_PORT", str(DEFAULT_P2P_PORT)))
         P2P_MANAGER = PeerManager(
@@ -966,6 +1203,7 @@ if __name__ == "__main__":
             listen_host=listen_host,
             listen_port=listen_port,
             on_tx=_handle_incoming_tx_from_peer,
+            on_block=_handle_incoming_block_from_peer,
         )
         P2P_MANAGER.start()
         print(f"[P2P] node_id={NODE_ID} listening on {listen_host}:{listen_port}")
