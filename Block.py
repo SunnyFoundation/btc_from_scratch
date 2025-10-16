@@ -146,25 +146,33 @@ def build_candidate_block(
     bits=DEFAULT_BITS,
     message="",
     timestamp=None,
+    transactions=None,
+    fees=0,
 ):
     """
-    Construct a block header ready for mining with a coinbase transaction as the
-    sole transaction. Returns the block instance and the coinbase transaction.
+    Construct a block header ready for mining.
+    Returns the block instance and the coinbase transaction.
     """
     if timestamp is None:
         timestamp = int(time.time())
 
-    coinbase_tx = create_coinbase_tx(height, address, subsidy, message=message)
-    coinbase_hash_le = bytes.fromhex(coinbase_tx.id())[::-1]
+    reward = subsidy + (fees or 0)
+    coinbase_tx = create_coinbase_tx(height, address, reward, message=message)
+
+    txs = [coinbase_tx] + (transactions or [])
+
+    tx_hashes_be = [bytes.fromhex(tx.id()) for tx in txs]
+    merkle_root_be = merkle_root(tx_hashes_be)
+    tx_hashes_le = [h[::-1] for h in tx_hashes_be]
 
     block = Block(
         version=1,
         prev_block=prev_block,
-        merkle_root_bytes=coinbase_hash_le,
+        merkle_root_bytes=merkle_root_be[::-1],
         timestamp=timestamp,
         bits=bits,
         nonce=b"\x00\x00\x00\x00",
-        tx_hashes=[coinbase_hash_le],
+        tx_hashes=tx_hashes_le,
     )
     return block, coinbase_tx
 

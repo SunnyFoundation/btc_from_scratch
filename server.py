@@ -391,6 +391,32 @@ def _handle_incoming_tx_from_peer(raw_tx_hex: str, origin: Optional[str]) -> Non
         P2P_MANAGER.broadcast_tx(stored_hex or raw_tx_hex, origin=origin)
 
 
+def _apply_confirmed_transaction(tx: Tx) -> None:
+    txid = tx.id()
+    for tx_in in tx.tx_ins:
+        prev_txid = tx_in.prev_tx.hex()
+        key = f"{prev_txid}:{tx_in.prev_index}"
+        UTXO_SET.pop(key, None)
+    for index, tx_out in enumerate(tx.tx_outs):
+        try:
+            cmds = tx_out.script_pubkey.cmds
+        except AttributeError:
+            continue
+        if len(cmds) != 5 or cmds[0] != 0x76 or cmds[1] != 0xA9:
+            continue
+        h160 = cmds[2]
+        if not isinstance(h160, bytes):
+            continue
+        address = encode_base58_checksum(b"\x6f" + h160)
+        key = f"{txid}:{index}"
+        UTXO_SET[key] = {
+            "address": address,
+            "amount_sats": tx_out.amount,
+            "txid": txid,
+            "vout": index,
+        }
+
+
 def _decode_base58_with_checksum(s: str) -> bytes:
     num = 0
     for c in s:
@@ -552,8 +578,62 @@ class AddressHandler(BaseHTTPRequestHandler):
         height = len(BLOCKCHAIN)
         prev_block = BLOCKCHAIN[-1].hash()[::-1] if BLOCKCHAIN else b"\x00" * 32
 
+        selected_txs: List[Tx] = []
+        spent_in_block = set()
+        total_fees = 0
+        # select transactions by descending fee
+        for txid, info in sorted(
+            MEMPOOL.items(), key=lambda item: item[1].get("fee_sats", 0), reverse=True
+        ):
+            raw_hex = info.get("tx_hex")
+            if not raw_hex:
+                continue
+            try:
+                tx = Tx.parse(BytesIO(bytes.fromhex(raw_hex)), testnet=True)
+            except Exception:
+                continue
+            try:
+                script_pubkeys = _extract_input_scripts(tx)
+            except ValueError:
+                continue
+
+            for idx, script in enumerate(script_pubkeys):
+                tx.tx_ins[idx].script_pubkey = (  # type: ignore[attr-defined]
+                    lambda testnet=True, script=script: script
+                )
+
+            temp_spent = []
+            conflict = False
+            for tx_in in tx.tx_ins:
+                key = f"{tx_in.prev_tx.hex()}:{tx_in.prev_index}"
+                if key in spent_in_block:
+                    conflict = True
+                    break
+                temp_spent.append(key)
+            if conflict:
+                continue
+
+            valid = True
+            for idx, script in enumerate(script_pubkeys):
+                z = tx.sig_hash(idx)
+                combined = tx.tx_ins[idx].script_sig + script
+                if not combined.evaluate(z):
+                    valid = False
+                    break
+            if not valid:
+                continue
+
+            selected_txs.append(tx)
+            spent_in_block.update(temp_spent)
+            total_fees += info.get("fee_sats") or 0
+
         block, coinbase_tx = build_candidate_block(
-            height, prev_block, address, message=message
+            height,
+            prev_block,
+            address,
+            message=message,
+            transactions=selected_txs,
+            fees=total_fees,
         )
 
         mined_block = mine_block(block, start_nonce=start_nonce, max_nonce=max_nonce)
@@ -586,9 +666,18 @@ class AddressHandler(BaseHTTPRequestHandler):
             "txid": coinbase_txid,
             "vout": 0,
         }
+
+        for tx in selected_txs:
+            _apply_confirmed_transaction(tx)
+            MEMPOOL.pop(tx.id(), None)
+
         _persist_utxos()
         _recalculate_balances()
         _persist_balances()
+
+        result["tx_count"] = len(selected_txs)
+        result["fees_sats"] = total_fees
+        result["transactions"] = [tx.id() for tx in selected_txs]
         self._send_json(result, status=201)
 
     def _handle_send(self):
